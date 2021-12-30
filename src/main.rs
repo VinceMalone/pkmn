@@ -1,326 +1,64 @@
-extern crate csv;
-extern crate strsim;
+#[macro_use]
+extern crate log;
 
 use std::error::Error;
-use std::fmt::Display;
 
 use clap::{App, Arg};
-use console::{pad_str, style};
+use console::style;
 use image::load_from_memory;
 use num_format::{Locale, ToFormattedString};
-use regex::Regex;
-use serde::Deserialize;
-use strsim::{jaro_winkler, levenshtein};
-use viuer::{print, Config};
 
-#[derive(Debug, Deserialize)]
-enum PokeStatus {
-    Normal,
-    Legendary,
-    Mythical,
-    #[serde(rename(deserialize = "Sub Legendary"))]
-    SubLegendary,
-}
+use pokedex::{PokeMatch, Pokemon, PokemonStatus};
+use print::{styled_empty_value, Printer};
 
-#[derive(Debug, Deserialize)]
-struct PokeRecord {
-    pokedex_number: u16,
-    name: String,
-    generation: u8,
-    status: PokeStatus,
-    species: String,
-    type_1: String,
-    type_2: String,
-    height_m: Option<f32>,
-    weight_kg: Option<f32>,
-    abilities_number: u8,
-    ability_1: String,
-    ability_2: String,
-    ability_hidden: String,
-    total_points: u16,
-    hp: u16,
-    attack: u16,
-    defense: u16,
-    sp_attack: u16,
-    sp_defense: u16,
-    speed: u16,
-    catch_rate: Option<u16>,
-    base_friendship: Option<u16>,
-    base_experience: Option<u16>,
-    growth_rate: String,
-    egg_type_number: u8,
-    egg_type_1: String,
-    egg_type_2: String,
-    percentage_male: Option<f32>,
-    egg_cycles: Option<u16>,
-}
+mod pokedex;
+mod print;
 
-#[derive(Debug)]
-struct DistanceRecord {
-    poke: PokeRecord,
-    levenshtein: usize,
-    jaro_winkler: f64,
-}
+mod join {
+    use std::convert::identity;
 
-impl DistanceRecord {
-    pub fn new(poke: PokeRecord, query: &str) -> Self {
-        let name = &poke.name.to_lowercase();
+    pub fn not_empty(value: String) -> bool {
+        !value.is_empty()
+    }
 
-        DistanceRecord {
-            poke,
-            levenshtein: levenshtein(name, query),
-            jaro_winkler: jaro_winkler(name, query),
-        }
+    pub fn filter_and_map<Filter: Fn(String) -> bool, Map: Fn(String) -> String>(
+        values: Vec<&str>,
+        separator: &str,
+        filter_fn: Filter,
+        map_fn: Map,
+    ) -> String {
+        values
+            .into_iter()
+            .filter_map(|value| {
+                if filter_fn(value.to_string()) {
+                    Some(map_fn(value.to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<String>>()
+            .join(separator)
+    }
+
+    pub fn filter<F: Fn(String) -> bool>(
+        values: Vec<&str>,
+        separator: &str,
+        filter_fn: F,
+    ) -> String {
+        filter_and_map(values, separator, filter_fn, identity)
     }
 }
 
-pub static POKEDEX_CSV: &[u8] = include_bytes!("../data/pokedex.csv");
-
-async fn dex(query: &str) -> Result<(), Box<dyn Error>> {
-    println!("Searching for: {}", query);
-
-    let search_query = query.to_lowercase();
-    let mut poke_distances = Vec::new();
-    let mut csv_reader = csv::Reader::from_reader(POKEDEX_CSV);
-
-    for result in csv_reader.deserialize() {
-        let poke_record: PokeRecord = result?;
-        let distance_record = DistanceRecord::new(poke_record, &search_query);
-        poke_distances.push(distance_record);
+fn optional_empty(value: &str) -> Option<&str> {
+    if value.is_empty() {
+        return None;
     }
-
-    poke_distances.sort_by(|a, b| {
-        b.jaro_winkler
-            .partial_cmp(&a.jaro_winkler)
-            .unwrap()
-            .then(a.levenshtein.cmp(&b.levenshtein))
-    });
-
-    // poke_distances.truncate(20);
-    // for poke_distance in poke_distances {
-    //     println!("{:?}", poke_distance);
-    // }
-
-    let pokemon = poke_distances.first();
-    match pokemon {
-        None => print_failure("Couldn't find any matches"),
-        Some(p) => {
-            println!();
-            println!();
-
-            print_poke_image(&p.poke).await?;
-
-            println!();
-
-            println!("{}", style(center(&p.poke.name)).yellow());
-
-            match &p.poke.status {
-                PokeStatus::Normal => {} // do nothing
-                status => println!(
-                    "{}",
-                    style(center(match status {
-                        PokeStatus::Legendary | PokeStatus::SubLegendary => "Legendary Pokémon",
-                        PokeStatus::Mythical => "Mythical Pokémon",
-                        PokeStatus::Normal => "",
-                    }))
-                    .green(),
-                ),
-            }
-
-            println!("{}", center(&format!("Generation {}", p.poke.generation)));
-
-            println!();
-
-            print_section_heading("Pokédex data");
-            print_info("National №", style(p.poke.pokedex_number).yellow());
-            print_info(
-                "Type",
-                style(join(vec![&p.poke.type_1, &p.poke.type_2], " | ")).magenta(),
-            );
-            print_info("Species", style(&p.poke.species).cyan());
-            print_info(
-                "Height",
-                match p.poke.height_m {
-                    Some(val) => style(format!("{} m", val)).cyan(),
-                    None => style(String::from("-")).dim(),
-                },
-            );
-            print_info(
-                "Weight",
-                match p.poke.weight_kg {
-                    Some(val) => style(format!("{} kg", val)).cyan(),
-                    None => style(String::from("-")).dim(),
-                },
-            );
-
-            let abilities_label = match p.poke.abilities_number {
-                1 => "Ability",
-                _ => "Abilities",
-            };
-            print_info(abilities_label, style(&p.poke.ability_1).cyan());
-            if !p.poke.ability_2.is_empty() {
-                print_info("", style(&p.poke.ability_2).cyan());
-            }
-            if !p.poke.ability_hidden.is_empty() {
-                print_info(
-                    "",
-                    format!(
-                        "{} {}",
-                        style(&p.poke.ability_hidden).cyan(),
-                        style("(hidden ability)").dim()
-                    ),
-                );
-            }
-
-            println!();
-
-            print_section_heading("Base Stats");
-            print_info("HP", style(p.poke.hp).cyan());
-            print_info("Attack", style(p.poke.attack).cyan());
-            print_info("Defense", style(p.poke.defense).cyan());
-            print_info("Sp. Attack", style(p.poke.sp_attack).cyan());
-            print_info("Sp. Defense", style(p.poke.sp_defense).cyan());
-            print_info("Speed", style(p.poke.speed).cyan());
-            print_info("Total", style(p.poke.total_points).cyan().bold());
-
-            println!();
-
-            print_section_heading("Training");
-            print_info(
-                "Catch Rate",
-                match p.poke.catch_rate {
-                    Some(val) => style(val.to_string()).cyan(),
-                    None => style(String::from("-")).dim(),
-                },
-            );
-            print_info(
-                "Base Friendship",
-                match p.poke.base_friendship {
-                    Some(val) => style(val.to_string()).cyan(),
-                    None => style(String::from("-")).dim(),
-                },
-            );
-            print_info(
-                "Base Experience",
-                match p.poke.base_experience {
-                    Some(val) => style(val.to_string()).cyan(),
-                    None => style(String::from("-")).dim(),
-                },
-            );
-            print_info("Growth Rate", style(&p.poke.growth_rate).cyan());
-
-            println!();
-
-            if p.poke.egg_type_number > 0 {
-                print_section_heading("Breeding");
-                print_info(
-                    "Egg Groups",
-                    style(join(vec![&p.poke.egg_type_1, &p.poke.egg_type_2], ", ")).cyan(),
-                );
-                print_info(
-                    "Gender",
-                    match p.poke.percentage_male {
-                        Some(val) => {
-                            style(format!("{}% male, {}% female", val, 100.0 - val)).cyan()
-                        }
-                        None => style(String::from("-")).dim(),
-                    },
-                );
-                print_info(
-                    "Egg Cycles",
-                    match p.poke.egg_cycles {
-                        Some(val) => {
-                            let egg_cycle_factor = 257;
-                            let max = val * egg_cycle_factor;
-                            let min = ((val - 1) * egg_cycle_factor) + 1;
-
-                            style(format!(
-                                "{} {}",
-                                val,
-                                style(format!(
-                                    "({}–{} steps)",
-                                    min.to_formatted_string(&Locale::en),
-                                    max.to_formatted_string(&Locale::en),
-                                ))
-                                .white()
-                                .dim(),
-                            ))
-                            .cyan()
-                        }
-                        None => style(String::from("-")).dim(),
-                    },
-                );
-            }
-
-            println!();
-            println!();
-        }
-    }
-
-    Ok(())
+    Some(value)
 }
 
-fn join(list: Vec<&str>, separator: &str) -> String {
-    list.into_iter()
-        .filter(|x| !x.is_empty())
-        .collect::<Vec<&str>>()
-        .join(separator)
-}
+async fn download_image(url: &str) -> Result<image::DynamicImage, Box<dyn Error>> {
+    info!("downloading image from \"{}\"", url);
 
-fn print_info<T1: Display, T2: Display>(label: T1, info: T2) {
-    println!("{:>39}  {}", style(label), info);
-}
-
-fn print_section_heading(heading: &str) {
-    print_info(style(heading).bold(), "");
-}
-
-fn center(message: &str) -> String {
-    pad_str(message, 80, console::Alignment::Center, None).to_string()
-}
-
-fn print_failure(message: &str) {
-    println!();
-    println!(
-        "{}",
-        style(pad_str(message, 80, console::Alignment::Center, None)).red()
-    );
-    println!();
-}
-
-fn slugify_poke_name(name: &str) -> String {
-    let mega_re = Regex::new("^mega-(?P<name>.+?)(?P<xy>-x|-y)?$").unwrap();
-    let n = name.to_lowercase().replace(" ", "-");
-    mega_re.replace(&n, "$name-mega$xy").to_string()
-}
-
-async fn print_poke_image(poke: &PokeRecord) -> Result<(), Box<dyn Error>> {
-    let url = format!(
-        "https://raw.githubusercontent.com/itsjavi/pokemon-assets/master/assets/img/pokemon/{}.png",
-        slugify_poke_name(&poke.name)
-    );
-
-    let image_result = image_from_url(&url).await;
-
-    match image_result {
-        Err(err) => print_failure(&format!("Image: {}", err)),
-        Ok(image) => {
-            let conf = Config {
-                transparent: true,
-                absolute_offset: false,
-                x: 6,
-                y: 0,
-                width: Some(68),
-                ..Default::default()
-            };
-            print(&image, &conf).expect("Image printing failed.");
-        }
-    }
-
-    Ok(())
-}
-
-async fn image_from_url(url: &str) -> Result<image::DynamicImage, Box<dyn Error>> {
     let res = reqwest::get(url).await?;
 
     match res.status() {
@@ -333,23 +71,272 @@ async fn image_from_url(url: &str) -> Result<image::DynamicImage, Box<dyn Error>
     }
 }
 
+struct PokemonPrinter {
+    pokemon: Pokemon,
+    printer: Printer,
+}
+
+impl PokemonPrinter {
+    fn pokemon_status(&self) -> Option<String> {
+        match &self.pokemon.status {
+            PokemonStatus::Normal => None,
+            status => Some(format!("{} Pokémon", status.display_name())),
+        }
+    }
+
+    fn pokemon_types(&self) -> String {
+        join::filter_and_map(
+            vec![&self.pokemon.type_1, &self.pokemon.type_2],
+            " | ",
+            join::not_empty,
+            |pkmn_type| style(pkmn_type).magenta().to_string(),
+        )
+    }
+
+    fn pokemon_egg_groups(&self) -> String {
+        join::filter(
+            vec![&self.pokemon.egg_type_1, &self.pokemon.egg_type_2],
+            ", ",
+            join::not_empty,
+        )
+    }
+
+    fn pokemon_genders(&self) -> Option<String> {
+        self.pokemon.percentage_male.map(|percentage_male| {
+            format!(
+                "{}% male, {}% female",
+                percentage_male,
+                100.0 - percentage_male
+            )
+        })
+    }
+
+    fn pokemon_egg_cycles(&self) -> Option<String> {
+        self.pokemon.egg_cycle_stats().map(|stats| {
+            let range = format!(
+                "({}–{} steps)",
+                stats.min_steps.to_formatted_string(&Locale::en),
+                stats.max_steps.to_formatted_string(&Locale::en),
+            );
+
+            format!("{} {}", stats.cycles, style(range).white().dim())
+        })
+    }
+
+    async fn print_sprite(&self) {
+        let url = self.pokemon.sprite_url();
+
+        match download_image(&url).await {
+            Err(err) => self.printer.print_failure(&format!("Image: {}", err)),
+            Ok(image) => {
+                if let Err(_) = self.printer.print_image(&image, 68) {
+                    warn!("image failed to print");
+                }
+            }
+        }
+    }
+
+    fn print_header(&self) {
+        let PokemonPrinter { pokemon, printer } = self;
+
+        printer.print_center(style(&pokemon.name).yellow());
+
+        if let Some(status) = self.pokemon_status() {
+            printer.print_center(style(status).green());
+        }
+
+        printer.print_center(format!("Generation {}", pokemon.generation));
+    }
+
+    fn print_pokedex_section(&self) {
+        let PokemonPrinter { pokemon, printer } = self;
+
+        printer.print_section_heading("Pokédex data");
+
+        printer.print_info("National №", style(pokemon.pokedex_number).yellow());
+
+        printer.print_info("Type", style(self.pokemon_types()).magenta());
+
+        printer.print_info("Species", style(&pokemon.species).cyan());
+
+        printer.print_info(
+            "Height",
+            match pokemon.height_m {
+                Some(val) => style(format!("{} m", val)).cyan(),
+                None => styled_empty_value(),
+            },
+        );
+
+        printer.print_info(
+            "Weight",
+            match pokemon.weight_kg {
+                Some(val) => style(format!("{} kg", val)).cyan(),
+                None => styled_empty_value(),
+            },
+        );
+
+        printer.print_info(
+            match pokemon.abilities_number {
+                1 => "Ability",
+                _ => "Abilities",
+            },
+            style(&pokemon.ability_1).cyan(),
+        );
+
+        if !pokemon.ability_2.is_empty() {
+            printer.print_info("", style(&pokemon.ability_2).cyan());
+        }
+
+        if !pokemon.ability_hidden.is_empty() {
+            printer.print_info(
+                "",
+                format!(
+                    "{} {}",
+                    style(&pokemon.ability_hidden).cyan(),
+                    style("(hidden ability)").dim()
+                ),
+            );
+        }
+    }
+
+    fn print_stats_section(&self) {
+        let PokemonPrinter { pokemon, printer } = self;
+
+        printer.print_section_heading("Base Stats");
+        printer.print_info("HP", style(pokemon.hp).cyan());
+        printer.print_info("Attack", style(pokemon.attack).cyan());
+        printer.print_info("Defense", style(pokemon.defense).cyan());
+        printer.print_info("Sp. Attack", style(pokemon.sp_attack).cyan());
+        printer.print_info("Sp. Defense", style(pokemon.sp_defense).cyan());
+        printer.print_info("Speed", style(pokemon.speed).cyan());
+        printer.print_info("Total", style(pokemon.total_points).cyan().bold());
+    }
+
+    fn print_training_section(&self) {
+        let PokemonPrinter { pokemon, printer } = self;
+
+        printer.print_section_heading("Training");
+
+        printer.print_info(
+            "Catch Rate",
+            match pokemon.catch_rate {
+                Some(val) => style(val.to_string()).cyan(),
+                None => styled_empty_value(),
+            },
+        );
+
+        printer.print_info(
+            "Base Friendship",
+            match pokemon.base_friendship {
+                Some(val) => style(val.to_string()).cyan(),
+                None => styled_empty_value(),
+            },
+        );
+
+        printer.print_info(
+            "Base Experience",
+            match pokemon.base_experience {
+                Some(val) => style(val.to_string()).cyan(),
+                None => styled_empty_value(),
+            },
+        );
+
+        printer.print_info(
+            "Growth Rate",
+            match optional_empty(&pokemon.growth_rate) {
+                Some(growth_rate) => style(growth_rate.to_owned()).cyan(),
+                None => styled_empty_value(),
+            },
+        );
+    }
+
+    fn print_breeding_section(&self) {
+        let PokemonPrinter { printer, .. } = self;
+
+        printer.print_section_heading("Breeding");
+
+        printer.print_info(
+            "Egg Groups",
+            match optional_empty(&self.pokemon_egg_groups()) {
+                Some(egg_groups) => style(egg_groups.to_owned()).cyan(),
+                None => styled_empty_value(),
+            },
+        );
+
+        printer.print_info(
+            "Gender",
+            match self.pokemon_genders() {
+                Some(genders) => style(genders).cyan(),
+                None => styled_empty_value(),
+            },
+        );
+
+        printer.print_info(
+            "Egg Cycles",
+            match self.pokemon_egg_cycles() {
+                Some(egg_cycles) => style(egg_cycles).cyan(),
+                None => styled_empty_value(),
+            },
+        );
+    }
+}
+
+async fn print_pokemon(pokemon: Pokemon, printer: Printer) {
+    let poke_printer = PokemonPrinter { pokemon, printer };
+
+    poke_printer.print_sprite().await;
+    println!();
+    poke_printer.print_header();
+    println!();
+    poke_printer.print_pokedex_section();
+    println!();
+    poke_printer.print_stats_section();
+    println!();
+    poke_printer.print_training_section();
+    println!();
+    poke_printer.print_breeding_section();
+    println!();
+    println!();
+}
+
+async fn lookup_pokemon_by_name(query: &str) {
+    let printer = Printer { width: 80 };
+    let results = pokedex::search_by_name(&query, 5);
+
+    for (i, PokeMatch { pokemon, score }) in results.iter().enumerate() {
+        info!(
+            "match #{}, {} ({}), similarity: {}, distance: {}",
+            i + 1,
+            &pokemon.name,
+            pokemon.pokedex_number,
+            score.similarity,
+            score.distance,
+        );
+    }
+
+    match results.first() {
+        None => printer.print_failure("Couldn't find any matches"),
+        Some(poke_match) => {
+            print_pokemon(poke_match.pokemon.clone(), printer).await;
+        }
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let matches = App::new("PokeRust")
+async fn main() {
+    pretty_env_logger::init();
+
+    let matches = App::new(env!("CARGO_PKG_NAME"))
+        .version(env!("CARGO_PKG_VERSION"))
         .arg(
             Arg::with_name("search")
                 .short("s")
                 .long("search")
-                .value_name("Searches for a Pokemon")
+                .value_name("Searches for a Pokèmon")
                 .takes_value(true),
         )
         .get_matches();
 
-    let search = matches.value_of("search").unwrap_or("");
-    if let Err(err) = dex(search).await {
-        println!("error during search: {}", err);
-        std::process::exit(1);
-    }
-
-    Ok(())
+    let search_query = matches.value_of("search").unwrap_or("");
+    lookup_pokemon_by_name(search_query).await;
 }

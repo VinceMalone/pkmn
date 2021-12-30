@@ -1,6 +1,6 @@
 [package]
 name = "pkmn"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -10,7 +10,9 @@ clap = "2.34.0"
 console = "0.15.0"
 csv = "1.1.6"
 image = "0.23.14"
+log = "0.4.14"
 num-format = "0.4.0"
+pretty_env_logger = "0.4.0"
 regex = "1.5.4"
 reqwest = { version = "0.11.8", features = ["json"] }
 serde = { version = "1.0.132", features = ["derive"] }
